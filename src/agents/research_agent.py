@@ -1,5 +1,7 @@
 """Research Agent: gathers evidence relevant to the claim using web search + tool calling."""
 
+from typing import Optional
+
 from langgraph.prebuilt import create_react_agent
 
 from src.llm import get_llm
@@ -29,7 +31,15 @@ When you are done searching, respond with a concise bullet-point list of finding
 Each bullet must cite the source URL it came from."""
 
 
-def run_research_agent(claim: str) -> str:
-    agent = create_react_agent(get_llm(), tools=[search_tool], prompt=SYSTEM_PROMPT)
-    result = agent.invoke({"messages": [("user", f"Claim to research: {claim}")]})
+def run_research_agent(
+    claim: str, retry_context: Optional[str] = None, temperature: float = 0.0
+) -> str:
+    """retry_context and temperature are only set when the graph is looping back
+    here after a low-confidence verdict (see _route_after_judge in graph.py) -
+    a plain first pass leaves both at their defaults."""
+    agent = create_react_agent(get_llm(temperature=temperature), tools=[search_tool], prompt=SYSTEM_PROMPT)
+    user_message = f"Claim to research: {claim}"
+    if retry_context:
+        user_message += f"\n\n{retry_context}"
+    result = agent.invoke({"messages": [("user", user_message)]})
     return result["messages"][-1].content

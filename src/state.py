@@ -23,3 +23,8 @@ class GraphState(TypedDict, total=False):
 
     # Human-readable log of what happened at each step, shown in the CLI output
     trace: List[str]
+
+    # How many times Research has run for this claim. 0 on the first pass;
+    # incremented when the Judge's confidence is too low and the graph loops
+    # back - see _route_after_judge() in graph.py.
+    attempts: int

@@ -8,13 +8,21 @@ web UI (FastAPI + React).
 
 ```
 claim → Research Agent → Adversarial Agent → Synthesis Agent → Judge Agent → verdict
-              │                  │
-              └── search_tool (DuckDuckGo, free) ──┘
+              │                  │                                  │
+              └── search_tool (DuckDuckGo, free) ──┘                  │
+                              ▲                                       │
+                              └── retry if confidence < 50% (max once) ┘
 ```
 
-The four agents always run **sequentially** — each one needs the previous
-agent's output, so there's no parallelism to be had here (see
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#orchestration-layer)).
+The four agents run **sequentially** — each one needs the previous agent's
+output, so there's no parallelism to be had there. The orchestration itself
+isn't purely linear, though: if the Judge's confidence comes back below 50%,
+the graph loops back to Research once (with a note about why the first
+attempt fell short) before finishing — a real, data-dependent decision, not
+just a fixed 4-step sequence. See
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#the-retry-loop-a-real-conditional-edge)
+for how that loop works and its limits (it can't catch a *confidently* wrong
+verdict, only an unconvincing one).
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full design
 rationale, and [`src/agents/README.md`](src/agents/README.md) /
@@ -134,9 +142,12 @@ pip install pytest
 pytest
 ```
 
-The bundled test (`tests/test_graph.py`) only checks that the graph compiles
-and contains the expected nodes — it doesn't call the LLM or the network, so it
-runs instantly and requires no Ollama instance.
+`tests/test_graph.py` checks that the graph compiles with the expected nodes,
+that the retry-routing logic (`_route_after_judge`) makes the right call for
+low/high/unparseable confidence, and — with the four agent functions mocked
+out — that the compiled graph actually loops back to Research on a low-
+confidence first pass and returns the retry's result. None of it calls a real
+LLM or the network, so it runs instantly and requires no Ollama instance.
 
 ## Project layout
 
@@ -186,9 +197,13 @@ Research Agent's search prompt in `src/agents/research_agent.py` further.
 - **New tool** (e.g. Wikipedia, a fact-check database API): add a `@tool`
   function in `src/tools/`, then add it to the `tools=[...]` list in
   `src/agents/research_agent.py` / `adversarial_agent.py`.
-- **Loop back on low confidence**: add a conditional edge in `src/graph.py`
-  from `judge` back to `research` when `state["confidence"]` is below a
-  threshold — see the note in `docs/ARCHITECTURE.md`.
+- **Tune the retry loop**: `CONFIDENCE_THRESHOLD` and `MAX_ATTEMPTS` in
+  `src/graph.py` control when the graph loops back to Research instead of
+  finishing — see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#the-retry-loop-a-real-conditional-edge).
+  Note that `api.py`'s streaming endpoint mirrors this rule by hand rather than
+  running the graph itself, so a change here needs the matching constants
+  re-imported (already done) or, better, the follow-up described there
+  (switch `check-stream` to LangGraph's own streaming mode).
 - **Swap models per agent**: `get_llm()` in `src/llm.py` takes a `temperature`
   argument today; extend it to accept a model override if you want, e.g., a
   larger model just for the Judge.

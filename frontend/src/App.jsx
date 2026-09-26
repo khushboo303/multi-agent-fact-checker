@@ -42,6 +42,7 @@ function App() {
   const [error, setError] = useState(null)
   const [result, setResult] = useState(null)
   const [stepStatus, setStepStatus] = useState(IDLE_STEP_STATUS)
+  const [retryNotice, setRetryNotice] = useState(null)
 
   const submit = (e) => {
     e.preventDefault()
@@ -52,6 +53,7 @@ function App() {
     setError(null)
     setResult(null)
     setStepStatus(IDLE_STEP_STATUS)
+    setRetryNotice(null)
 
     // A GET + EventSource stream, one event per agent as it starts/finishes, so the
     // UI reflects the pipeline's real sequential execution instead of a single opaque wait.
@@ -61,6 +63,17 @@ function App() {
     source.addEventListener('step', (evt) => {
       const { agent, state } = JSON.parse(evt.data)
       setStepStatus((prev) => ({ ...prev, [agent]: state }))
+    })
+
+    source.addEventListener('retry', (evt) => {
+      // The graph judged its own first answer unconvincing (confidence below its
+      // threshold) and looped back to Research instead of finishing - a real,
+      // data-dependent orchestration decision, not just the fixed 4-step sequence.
+      const { attempt, confidence } = JSON.parse(evt.data)
+      setRetryNotice(
+        `Confidence was only ${confidence}% on attempt ${attempt} - retrying with a broader search...`
+      )
+      setStepStatus(IDLE_STEP_STATUS)
     })
 
     source.addEventListener('final', (evt) => {
@@ -115,6 +128,7 @@ function App() {
 
       {loading && (
         <div className="progress">
+          {retryNotice && <p className="retry-banner">{retryNotice}</p>}
           {AGENT_STEPS.map((step, i) => {
             const status = stepStatus[step.key]
             return (

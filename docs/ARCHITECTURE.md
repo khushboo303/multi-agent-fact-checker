@@ -4,59 +4,83 @@
 
 `src/graph.py` is the orchestration layer: it defines the shared `GraphState`
 that flows between agents, wraps each agent as a graph node, and wires the
-nodes into a single linear [LangGraph](https://langchain-ai.github.io/langgraph/)
-`StateGraph`:
+nodes into a [LangGraph](https://langchain-ai.github.io/langgraph/)
+`StateGraph` with one real, data-dependent decision in it — whether to accept
+the Judge's verdict or loop back and try again:
 
 ```
         ┌──────────┐     ┌─────────────┐     ┌───────────┐     ┌───────┐
- claim →│ Research │────▶│ Adversarial │────▶│ Synthesis │────▶│ Judge │──▶ verdict
+ claim →│ Research │────▶│ Adversarial │────▶│ Synthesis │────▶│ Judge │
         │  Agent   │     │   Agent     │     │   Agent   │     │ Agent │
-        └──────────┘     └─────────────┘     └───────────┘     └───────┘
-             │                   │
-             └────── search_tool (DuckDuckGo) ──────┘
+        └──────────┘     └─────────────┘     └───────────┘     └───┬───┘
+             │                   │                       confidence≥50%? │
+             └────── search_tool (DuckDuckGo) ──────┘                    │
+                              ▲                                          │
+                              │            confidence<50% and            ▼
+                    ┌──────────────────┐   attempts<2              verdict
+                    │  prepare_retry    │◀──────────────────────────────┘
+                    └──────────────────┘
 ```
 
 Each node is a plain Python function `(GraphState) -> dict` that reads whatever
 fields it needs off the state and returns a partial update. LangGraph merges
-that update into the running state before calling the next node — this is the
-same pattern you'd use for a much larger graph (conditional branches, retries,
-parallel fan-out), just applied to the simplest useful case: one path, no
-branching.
+that update into the running state before calling the next node.
 
-**Execution is strictly sequential, not parallel.** Each node genuinely depends
-on the previous one's output (Adversarial needs the Research findings,
-Synthesis needs both, Judge needs the synthesis), so there's no independent
-work to fan out even if the graph wanted to. A single claim always means 4
-LLM calls in a row, which is why it takes noticeably longer than a single
-model call — see "API layer" below for how the UI surfaces this honestly
-instead of showing a generic spinner.
+**The Research → Adversarial → Synthesis → Judge portion is still strictly
+sequential**, for the same reason as before: each node genuinely depends on
+the previous one's output, so there's nothing to run in parallel there. What's
+no longer true is that the *whole graph* is a single fixed path — see below.
 
-### Why a graph instead of just calling four functions in a row?
+### The retry loop: a real conditional edge
 
-For this workflow's current shape, a plain function pipeline would do the same
-thing. The graph earns its place because it gives you, for free and without
-restructuring the agents:
+`graph.add_conditional_edges("judge", _route_after_judge, {"retry": "prepare_retry", "end": END})`
+is the one place this graph makes a decision instead of just following a fixed
+sequence. `_route_after_judge()` parses the Judge's `confidence` and checks it
+against `CONFIDENCE_THRESHOLD` (50): if it's below that *and* the claim hasn't
+already been retried (`MAX_ATTEMPTS = 2` total attempts), the graph routes to
+`prepare_retry` (which increments `state["attempts"]` and logs why) and then
+back to `research` — a real cycle, not a straight line. Otherwise it routes to
+`END`.
+
+On a retry, `_research_node` passes the previous attempt's confidence and
+reasoning back into the Research Agent's prompt (telling it not to just repeat
+the same searches) and raises its temperature from 0.0 to 0.4, so a second pass
+is more likely to actually differ from the first rather than reproduce the
+same result.
+
+**Important caveat:** this only fires when the Judge itself reports low
+confidence. A model that's *confidently wrong* — which is what happened with
+some of this project's known misses (see the root README) — won't trigger a
+retry, because nothing about the pipeline can tell "confident and correct"
+apart from "confident and wrong" without external ground truth. This loop
+makes the orchestration genuinely dynamic; it does not make the underlying
+model omniscient.
+
+### Why a graph instead of just calling functions with manual if/else?
+
+You could hand-write the retry loop as a Python `while` loop with an `if
+confidence < 50` check (in fact, `api.py`'s streaming endpoint does exactly
+that — see "API layer" below, and why). The graph earns its place instead by
+giving you, for free:
 
 - **A typed, shared state object** (`GraphState`) instead of passing growing
   argument lists between functions.
-- **A trace** of what happened at each step (`state["trace"]`), useful for
-  debugging and for showing the workflow's reasoning to a user.
-- **A natural extension point.** The most likely next feature — "if the Judge's
-  confidence is low, loop back to Research with a more targeted query" — is a
-  conditional edge (`add_conditional_edges`) away, not a rewrite. Same for
-  running Research and an independent Adversarial search in parallel, or adding
-  a human-approval step before the final verdict.
-
-If this project only ever needs the fixed four-step pipeline, that's a
-reasonable place to stop; the graph is kept intentionally linear here to match
-"don't complicate it more than the task needs."
+- **A trace** of what happened at each step, including *why* a retry
+  triggered (`state["trace"]`) — useful for debugging and for showing the
+  workflow's reasoning to a user.
+- **A structure that scales.** Adding a second, independent condition (e.g. "if
+  Adversarial found strong contradictions, route straight to Judge and skip
+  Synthesis") is another `add_conditional_edges` call, not a restructure of
+  hand-written control flow.
 
 ## State (`src/state.py`)
 
 `GraphState` is a `TypedDict` with one field per artifact the pipeline produces:
 `claim` (input), `research_findings`, `adversarial_findings`, `synthesis`,
-`verdict` / `confidence` / `reasoning` (final output), and `trace` (a running
-log). Nodes only touch the fields they own.
+`verdict` / `confidence` / `reasoning` (final output), `trace` (a running log),
+and `attempts` (how many times Research has run for this claim - `0` on the
+first pass, incremented by `_prepare_retry_node` on a retry). Nodes only touch
+the fields they own.
 
 ## Agents (`src/agents/`)
 
@@ -79,26 +103,34 @@ temperature.
 
 ## API layer (`api.py`)
 
-A thin FastAPI wrapper around the same graph the CLI uses — it doesn't
-reimplement any agent logic, just exposes it over HTTP for `frontend/`.
+A thin FastAPI wrapper exposing the same agents the CLI uses over HTTP for
+`frontend/` — but the two endpoints get there differently:
 
 - **`POST /api/check`** — runs `check_claim()` (the same function `cli.py`
-  calls) in a worker thread via `asyncio.to_thread`, and returns the full
-  result as one JSON object once all four agents have finished. Simple, but
-  the caller has no visibility into progress until it's all done.
-- **`GET /api/check-stream?claim=...`** — calls the four agent functions
-  directly (`run_research_agent`, `run_adversarial_agent`, etc. from
-  `src/agents`) one at a time, the same order `graph.py` wires them in, and
-  streams a Server-Sent Event before and after each one (`event: step`,
-  `{"agent": "research", "state": "active" | "done"}`), finishing with one
-  `event: final` carrying the complete result. This is what `frontend/` uses:
-  it lets the UI show each agent going pending → active → done in the graph's
-  real execution order, rather than a spinner that implies the agents might be
-  running together.
+  calls, which runs the *real* compiled graph including the retry loop) in a
+  worker thread via `asyncio.to_thread`, and returns the full result as one
+  JSON object once everything has finished. Simple, but the caller has no
+  visibility into progress until it's all done.
+- **`GET /api/check-stream?claim=...`** — this is what `frontend/` actually
+  uses. It does **not** call the compiled graph, because LangGraph's
+  `.invoke()` only returns once the whole run finishes, with no built-in hook
+  to pause and report progress after each node. Instead, `_stream_check()` in
+  `api.py` calls the four agent functions directly and **hand-mirrors** both
+  the node order and the retry rule (`CONFIDENCE_THRESHOLD`/`MAX_ATTEMPTS`,
+  imported from `graph.py` so the numbers can't drift out of sync) in a plain
+  Python `while` loop, emitting an SSE event before/after each agent
+  (`event: step`, `{"agent": "research", "state": "active" | "done"}`) and one
+  `event: retry` when it loops back, finishing with `event: final`.
 
-Both endpoints run the *same* underlying agents — `check-stream` isn't a
-different pipeline, just a differently-shaped way of observing the one graph
-already described above.
+This is a known duplication: the retry *decision* exists in two places
+(`graph.py`'s conditional edge, and a plain `if` in `_stream_check`) that have
+to be kept in sync by hand if the rule ever changes. The proper fix is to have
+`check-stream` consume LangGraph's own streaming mode (`app.stream(...,
+stream_mode="updates")`, which yields a state update after every node the
+*real* graph executes, retries included) instead of re-deriving the sequence -
+left as a follow-up since it also changes how "active" vs. "done" per-agent
+status would need to be derived (that mode reports "just finished", not
+"about to start").
 
 ## Data flow example
 
