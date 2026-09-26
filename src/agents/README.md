@@ -13,6 +13,19 @@ don't need tools.
 | `synthesis_agent.py` | Merge both sides into one balanced, neutral brief | none | claim + both findings | evidence brief (no verdict) |
 | `judge_agent.py` | Weigh the evidence brief and decide | none | claim + evidence brief | `VERDICT` / `CONFIDENCE` / `REASONING` |
 
+## Research Agent's search strategy
+
+`research_agent.py`'s prompt requires at least 3 differently-phrased queries
+per claim (the claim itself, a neutral/generic rephrasing, and one aimed at
+surfacing the single most prominent/official fact the claim's framing might
+omit), plus a rule to run a further, broader query if early results look thin
+or oddly narrow. This exists because a small local model doing a couple of
+narrow searches will sometimes miss a much more prominent fact entirely (e.g.
+missing a well-known national holiday because the first search only surfaced
+an obscure one) — widening the query strategy reduces, but does not
+eliminate, that failure mode. See the "Known limitation" section in the root
+README for what this can and can't fix.
+
 ## Why a separate adversarial step?
 
 A single research agent tends to confirm whatever it searches for first (the

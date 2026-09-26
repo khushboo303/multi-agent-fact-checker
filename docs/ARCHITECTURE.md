@@ -23,6 +23,14 @@ same pattern you'd use for a much larger graph (conditional branches, retries,
 parallel fan-out), just applied to the simplest useful case: one path, no
 branching.
 
+**Execution is strictly sequential, not parallel.** Each node genuinely depends
+on the previous one's output (Adversarial needs the Research findings,
+Synthesis needs both, Judge needs the synthesis), so there's no independent
+work to fan out even if the graph wanted to. A single claim always means 4
+LLM calls in a row, which is why it takes noticeably longer than a single
+model call — see "API layer" below for how the UI surfaces this honestly
+instead of showing a generic spinner.
+
 ### Why a graph instead of just calling four functions in a row?
 
 For this workflow's current shape, a plain function pipeline would do the same
@@ -69,10 +77,34 @@ agent calls this same factory — there's one place to change if you want to swa
 models, point at a remote Ollama instance, or give a specific agent a different
 temperature.
 
+## API layer (`api.py`)
+
+A thin FastAPI wrapper around the same graph the CLI uses — it doesn't
+reimplement any agent logic, just exposes it over HTTP for `frontend/`.
+
+- **`POST /api/check`** — runs `check_claim()` (the same function `cli.py`
+  calls) in a worker thread via `asyncio.to_thread`, and returns the full
+  result as one JSON object once all four agents have finished. Simple, but
+  the caller has no visibility into progress until it's all done.
+- **`GET /api/check-stream?claim=...`** — calls the four agent functions
+  directly (`run_research_agent`, `run_adversarial_agent`, etc. from
+  `src/agents`) one at a time, the same order `graph.py` wires them in, and
+  streams a Server-Sent Event before and after each one (`event: step`,
+  `{"agent": "research", "state": "active" | "done"}`), finishing with one
+  `event: final` carrying the complete result. This is what `frontend/` uses:
+  it lets the UI show each agent going pending → active → done in the graph's
+  real execution order, rather than a spinner that implies the agents might be
+  running together.
+
+Both endpoints run the *same* underlying agents — `check-stream` isn't a
+different pipeline, just a differently-shaped way of observing the one graph
+already described above.
+
 ## Data flow example
 
-1. **Research Agent** receives the claim, runs 2+ DuckDuckGo searches, returns
-   a bullet list of findings with source URLs.
+1. **Research Agent** receives the claim, runs 3+ differently-phrased
+   DuckDuckGo searches (see [`src/agents/README.md`](../src/agents/README.md#research-agents-search-strategy)),
+   returns a bullet list of findings with source URLs.
 2. **Adversarial Agent** receives the claim *and* the research findings, runs
    its own search(es) aimed at contradicting them, returns counter-evidence (or
    explicitly says it found none).

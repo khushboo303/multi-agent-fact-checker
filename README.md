@@ -3,13 +3,18 @@
 A LangGraph multi-agent claim-verification workflow: given a claim, four
 specialized agents research it, adversarially challenge it, synthesize the
 evidence, and render a judged verdict — all running on **free, local models via
-Ollama** (no paid API keys required).
+Ollama** (no paid API keys required). Usable from the command line or from a
+web UI (FastAPI + React).
 
 ```
 claim → Research Agent → Adversarial Agent → Synthesis Agent → Judge Agent → verdict
               │                  │
               └── search_tool (DuckDuckGo, free) ──┘
 ```
+
+The four agents always run **sequentially** — each one needs the previous
+agent's output, so there's no parallelism to be had here (see
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#orchestration-layer)).
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full design
 rationale, and [`src/agents/README.md`](src/agents/README.md) /
@@ -34,11 +39,14 @@ rationale, and [`src/agents/README.md`](src/agents/README.md) /
 | LLM | [Ollama](https://ollama.com) via `langchain-ollama` | Runs open models locally — completely free, no API key, no rate limits, private |
 | Tool calling | LangChain `@tool` + `create_react_agent` | Standard tool-calling loop for the Research and Adversarial agents |
 | Web search | [`duckduckgo-search`](https://pypi.org/project/duckduckgo-search/) | Free, no API key or signup required |
+| Backend API | [FastAPI](https://fastapi.tiangolo.com/) + [Uvicorn](https://www.uvicorn.org/) | Serves the graph over HTTP; a `GET /api/check-stream` SSE endpoint reports real per-agent progress |
+| Frontend | [React](https://react.dev/) + [Vite](https://vite.dev/) | Claim input, live sequential agent progress, verdict card, expandable evidence sections |
 | Config | `python-dotenv` + `.env` | Swap models / search settings without touching code |
 
 ## Requirements
 
 - Python 3.10+
+- Node.js + npm (only needed for the web frontend)
 - [Ollama](https://ollama.com/download) installed and running locally
 - A tool-calling-capable local model pulled, e.g.:
   ```bash
@@ -67,6 +75,8 @@ and the model from `.env` is pulled.
 
 ## Usage
 
+### Option A: command line
+
 ```bash
 # One-off claim from the command line
 python cli.py "The Great Wall of China is visible from space with the naked eye."
@@ -90,6 +100,33 @@ Reasoning:  Multiple reputable sources and astronaut testimony confirm the
 
 More example claims to try are in [`examples/sample_claims.txt`](examples/sample_claims.txt).
 
+### Option B: web UI
+
+Two servers, run in separate terminals.
+
+**Backend** (from the project root, with the venv activated):
+
+```bash
+uvicorn api:app --reload --port 8000
+```
+
+**Frontend**:
+
+```bash
+cd frontend
+npm install     # first time only
+npm run dev
+```
+
+Open the URL Vite prints (`http://localhost:5173`), enter a claim, and hit
+"Fact-check it." The page shows each agent going `pending → active → done` in
+real order as the pipeline actually executes them — not a generic spinner —
+followed by the verdict card and expandable Research / Adversarial / Synthesis
+sections.
+
+The frontend talks to the backend at `http://127.0.0.1:8000` (hardcoded in
+`frontend/src/App.jsx` as `API_BASE`); both must be running.
+
 ## Running the tests
 
 ```bash
@@ -105,7 +142,10 @@ runs instantly and requires no Ollama instance.
 
 ```
 multi-agent-fact-checker/
-├── cli.py                     # entry point
+├── cli.py                     # CLI entry point
+├── api.py                     # FastAPI backend (POST /api/check, GET /api/check-stream)
+├── frontend/                  # React + Vite web UI
+│   └── src/App.jsx
 ├── docs/
 │   └── ARCHITECTURE.md        # full design write-up
 ├── examples/
@@ -121,6 +161,25 @@ multi-agent-fact-checker/
 ├── .env.example
 └── requirements.txt
 ```
+
+## Known limitation: small local models can miss or misstate facts
+
+Running everything on a free, local, relatively small model (e.g. `qwen2.5:7b`)
+keeps this project free and private, but it caps result quality in two ways:
+
+- **Search coverage**: the Research/Adversarial Agents only see whatever a
+  handful of DuckDuckGo queries return. A real but less-obvious fact (e.g. a
+  regional holiday, a units-conversion nuance) can simply not surface in the
+  first few results, and the model has no way to know what it didn't see.
+- **Model recall**: a 7B-class model doesn't reliably "know" enough on its own
+  to catch a search gap, and can occasionally state a plausible-sounding but
+  fabricated detail.
+
+This isn't a bug in the pipeline — the graph, agents, and tool-calling all work
+as designed. If you need higher accuracy, the two levers (see
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)) are: use a larger/better local
+model in `OLLAMA_MODEL` (if your machine has the RAM for it), or widen/tune the
+Research Agent's search prompt in `src/agents/research_agent.py` further.
 
 ## Extending it
 
